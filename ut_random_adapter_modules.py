@@ -35,6 +35,26 @@ from train_gpt import BigramHashEmbedding, SmearGate, ValueEmbedding, Rotary
 
 
 # =============================================================================
+# Fake Quantization for QAT (Straight-Through Estimator)
+# =============================================================================
+
+def fake_quantize_int8_per_row(t: Tensor) -> Tensor:
+    """Simulate int8 per-row quantization with straight-through estimator.
+    
+    During training, this rounds weights to the nearest int8-representable value
+    (given per-row scales) but lets gradients flow through as if no rounding happened.
+    This teaches the optimizer to find weight distributions that survive int8 truncation.
+    """
+    with torch.no_grad():
+        t32 = t.float()
+        row_max = t32.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+        scale = row_max / 127.0
+        t_q = (torch.clamp(torch.round(t32 / scale), -127, 127) * scale).to(t.dtype)
+    # STE: forward uses quantized, backward uses identity
+    return t + (t_q - t).detach()
+
+
+# =============================================================================
 # Random Matrix Generation (deterministic, seed-reproducible)
 # =============================================================================
 
@@ -62,18 +82,24 @@ class RandomMatrixGenerator:
         """
         cache_key = f"{name}_{rows}_{cols}"
         if cache_key not in self._cache or self._cache[cache_key].device != device:
-            rng = torch.Generator(device='cpu')
             # Derive a unique seed per matrix from stable hash + base seed
             # CRITICAL: Python's hash() is salted per-process in Python 3.3+,
             # which would give different matrices on different DDP ranks.
             name_hash = int(hashlib.md5(name.encode('utf-8')).hexdigest()[:8], 16)
-            rng.manual_seed(self.seed ^ name_hash)
+            combined_seed = self.seed ^ name_hash
             
-            # Generate orthogonal matrix (or semi-orthogonal if non-square)
-            # For rows > cols: columns are orthonormal
-            # For rows < cols: rows are orthonormal
+            # Save and restore global RNG state so random matrix generation
+            # is fully deterministic regardless of when this is called.
+            # nn.init.orthogonal_ uses the global RNG, not an explicit generator,
+            # so we must control the global state directly.
+            global_rng_state = torch.random.get_rng_state()
+            torch.manual_seed(combined_seed)
+            
             mat = torch.empty(rows, cols)
             nn.init.orthogonal_(mat)
+            
+            # Restore global RNG state so we don't affect other randomness
+            torch.random.set_rng_state(global_rng_state)
             
             # Scale so that ||Wx|| ≈ ||x|| in expectation
             # This is the "gain" that preserves signal magnitude
@@ -99,6 +125,10 @@ class LowRankAdapter(nn.Module):
     The adapter matrices A and B are initialized so that A @ B ≈ 0 at init,
     meaning the model starts as a pure random projection and learns corrections.
     
+    Supports Late QAT: when qat_enabled is True, the fused ΔW = scale*(A@B) is
+    fake-quantized to int8 before being added to W_random, teaching AdamW to
+    find int8-friendly weight distributions.
+    
     Args:
         in_features: input dimension
         out_features: output dimension  
@@ -113,6 +143,7 @@ class LowRankAdapter(nn.Module):
         self.rank = rank
         self.alpha = alpha
         self.scale = alpha / rank  # LoRA-style scaling
+        self.qat_enabled = False  # Toggled externally during late QAT phase
         
         # A: (out_features, rank) - zero initialized
         # B: (rank, in_features) - small random init
@@ -120,15 +151,38 @@ class LowRankAdapter(nn.Module):
         self.A = nn.Parameter(torch.zeros(out_features, rank))
         self.B = nn.Parameter(torch.empty(rank, in_features))
         nn.init.normal_(self.B, std=init_scale)
+        
+        # Fused delta_w buffer: set by load_fused_state_dict() for eval.
+        # When not None, forward() uses this instead of computing A @ B.
+        self._fused_delta_w: Tensor | None = None
+    
+    def compute_delta_w(self, dtype: torch.dtype = None) -> Tensor:
+        """Compute the fused ΔW = scale * (A @ B).
+        
+        Used both in forward() and for post-training export.
+        """
+        d = dtype or self.A.dtype
+        return self.scale * (self.A.to(d) @ self.B.to(d))
     
     def forward(self, x: Tensor, W_random: Tensor) -> Tensor:
         """Apply random projection + learned correction via single fused GEMM.
         
-        Materializes W_eff = W_random + scale * (A @ B) then does one F.linear.
-        A @ B is cheap (out_features × rank) @ (rank × in_features), and the
-        single sequence-length GEMM is much faster than two separate passes.
+        Materializes W_eff = W_random + ΔW then does one F.linear.
+        
+        Three modes:
+        1. Normal training: ΔW = scale * (A @ B)
+        2. Late QAT training: ΔW = fake_quantize_int8(scale * (A @ B))
+        3. Fused eval: ΔW = scale * _fused_delta_w (unscaled A@B from export)
         """
-        W_eff = W_random.to(x.dtype) + self.scale * (self.A.to(x.dtype) @ self.B.to(x.dtype))
+        # Check for fused delta_w (loaded from fused export — stored unscaled)
+        if self._fused_delta_w is not None:
+            delta_w = self.scale * self._fused_delta_w.to(device=x.device, dtype=x.dtype)
+        else:
+            delta_w = self.compute_delta_w(x.dtype)
+            if self.qat_enabled and self.training:
+                delta_w = fake_quantize_int8_per_row(delta_w)
+        
+        W_eff = W_random.to(x.dtype) + delta_w
         return F.linear(x, W_eff)
 
 
@@ -493,22 +547,58 @@ class UTGPT(nn.Module):
             'W_down': (model_dim, mlp_dim),
         }
         # Generate and register random matrices as non-persistent buffers.
-        # This happens ONCE at init (before torch.compile), so dynamo never
-        # sees the torch.Generator code. Buffers move with .to(device) automatically.
-        self._random_matrices = {}
+        # Using register_buffer ensures model.to(device) moves them automatically,
+        # and Dynamo treats them as graph inputs without recompilation.
+        self._random_matrix_names = []
         for name, (rows, cols) in _random_matrix_specs.items():
             mat = self.rng.get_matrix(name, rows, cols, device=torch.device('cpu'), dtype=torch.bfloat16)
-            self._random_matrices[name] = mat
+            self.register_buffer(f'_rm_{name}', mat, persistent=False)
+            self._random_matrix_names.append(name)
     
     def _get_random_matrices(self) -> dict[str, Tensor]:
-        device = next(self.parameters()).device
-        out = {}
-        for name, mat in self._random_matrices.items():
-            if mat.device != device:
-                self._random_matrices[name] = mat.to(device=device)
-                mat = self._random_matrices[name]
-            out[name] = mat
-        return out
+        """Get all random matrices as a dict. Buffers are already on the correct device."""
+        return {name: getattr(self, f'_rm_{name}') for name in self._random_matrix_names}
+    
+    def set_qat(self, enabled: bool) -> None:
+        """Toggle Late QAT on all LowRankAdapter modules.
+        
+        When enabled, each adapter's forward() fake-quantizes ΔW = scale*(A@B)
+        to int8 before adding to W_random, teaching the optimizer to find
+        weight distributions that survive int8 truncation.
+        """
+        for module in self.modules():
+            if isinstance(module, LowRankAdapter):
+                module.qat_enabled = enabled
+    
+    @torch.no_grad()
+    def fused_export_state_dict(self) -> dict[str, Tensor]:
+        """Export state dict with fused ΔW matrices for int8-friendly storage.
+        
+        Exports unscaled A @ B (without the LoRA scale factor) so values are
+        in a reasonable numeric range for int8 quantization. The scale factor
+        is stored separately as a small scalar tensor per adapter.
+        
+        At eval time: ΔW = scale * dequant(A@B_int8), then W_eff = W_random + ΔW.
+        """
+        fused_sd = {}
+        
+        for name, param in self.state_dict().items():
+            # Skip A and B params — we'll replace them with fused delta_w
+            if '.A' in name or '.B' in name:
+                continue
+            fused_sd[name] = param.detach().cpu()
+        
+        # Fuse each adapter's A @ B into a dense matrix (WITHOUT scale)
+        for module_name, module in self.named_modules():
+            if isinstance(module, LowRankAdapter):
+                # Store unscaled A @ B for better int8 dynamic range
+                ab = (module.A.to(torch.bfloat16) @ module.B.to(torch.bfloat16))
+                fused_sd[f"{module_name}.delta_w"] = ab.detach().cpu()
+                # Store scale as a tiny scalar tensor (passthrough in int8 quantizer)
+                fused_sd[f"{module_name}.delta_scale"] = torch.tensor(
+                    module.scale, dtype=torch.float32)
+        
+        return fused_sd
     
     def _get_ve(self, step_idx: int, input_ids: Tensor, ve_cache: dict) -> Tensor | None:
         if self.ve_shared is None or step_idx not in self.ve_layer_indices:
@@ -629,3 +719,34 @@ class UTGPT(nn.Module):
         else:
             raise NotImplementedError
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+    
+    def load_fused_state_dict(self, fused_sd: dict[str, Tensor]) -> None:
+        """Load a state dict produced by fused_export_state_dict().
+        
+        The fused state dict contains dense 'delta_w' tensors (unscaled A@B)
+        and 'delta_scale' scalars instead of separate A and B parameters.
+        We register delta_w as a buffer; forward() applies: ΔW = scale * delta_w.
+        """
+        current_sd = self.state_dict()
+        load_sd = {}
+        for key in current_sd:
+            if '.A' in key or '.B' in key:
+                load_sd[key] = current_sd[key]
+            elif key in fused_sd:
+                load_sd[key] = fused_sd[key]
+            else:
+                load_sd[key] = current_sd[key]
+        
+        self.load_state_dict(load_sd, strict=True)
+        
+        # Register fused delta_w buffers and restore scales
+        for module_name, module in self.named_modules():
+            if isinstance(module, LowRankAdapter):
+                dw_key = f"{module_name}.delta_w"
+                scale_key = f"{module_name}.delta_scale"
+                if dw_key in fused_sd:
+                    if hasattr(module, '_fused_delta_w'):
+                        delattr(module, '_fused_delta_w')
+                    module.register_buffer('_fused_delta_w', fused_sd[dw_key].clone())
+                    if scale_key in fused_sd:
+                        module.scale = float(fused_sd[scale_key].item())

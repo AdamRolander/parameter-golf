@@ -490,12 +490,11 @@ def main() -> None:
     avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
     raw_model.load_state_dict(avg_state, strict=True)
 
-    # Diagnostic eval before quantization — use uncompiled model to avoid
-    # Dynamo recompile storms after EMA weight swap changes model state.
+    # Diagnostic eval before quantization
     torch.cuda.synchronize()
     t_diag = time.perf_counter()
     diag_val_loss, diag_val_bpb = eval_val(
-        args, base_model if distributed else raw_model,
+        args, compiled_model if not distributed else base_model,
         rank, world_size, device, grad_accum_steps,
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
@@ -707,3 +706,47 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+====================================================================================================
+Running Python 3.11.15 (main, Mar 11 2026, 17:20:07) [GCC 14.3.0]
+Running PyTorch 2.11.0+cu128
+====================================================================================================
+val_bpb:enabled tokenizer_kind=sentencepiece
+val_tokens:62021632
+=== Universal Transformer with Random Matrix Adapters ===
+model_params:10199080 (adapter:8847360 step:16896 embed:1179648 scalar:155176)
+architecture: d=768 heads=12 kv=6 mlp=3.0x R=11 K=3 rank=256 strategy=phase
+random_seed:42
+optimizer: AdamW (adapter_lr=0.01 embed_lr=0.035 scalar_lr=0.025)
+export_mode:fused_int8 qat:False qat_threshold:0.85
+water_cycle: enabled=False
+world_size:1 grad_accum_steps:8
+train_batch_tokens:524288 train_seq_len:2048 iterations:500
+seed:1337
+step:0/500 val_loss:6.9404 val_bpb:4.1105 train_time:0ms step_avg:0.01ms
+step:1/500 train_loss:6.9404 train_time:13105ms step_avg:13105.35ms
+step:2/500 train_loss:6.2102 train_time:14857ms step_avg:7428.74ms
+step:3/500 train_loss:5.9840 train_time:16610ms step_avg:5536.75ms
+step:4/500 train_loss:5.8878 train_time:18361ms step_avg:4590.26ms
+step:5/500 train_loss:5.6737 train_time:20118ms step_avg:4023.53ms
+step:6/500 train_loss:5.5419 train_time:21872ms step_avg:3645.37ms
+step:7/500 train_loss:5.3463 train_time:23628ms step_avg:3375.42ms
+step:8/500 train_loss:5.2210 train_time:25387ms step_avg:3173.40ms
+step:9/500 train_loss:5.0928 train_time:27143ms step_avg:3015.89ms
+step:10/500 train_loss:4.9912 train_time:28898ms step_avg:2889.81ms
+step:100/500 val_loss:3.7406 val_bpb:2.2154 train_time:186600ms step_avg:1866.00ms
+step:200/500 val_loss:3.5867 val_bpb:2.1243 train_time:361832ms step_avg:1809.16ms
+step:300/500 val_loss:3.5113 val_bpb:2.0796 train_time:537120ms step_avg:1790.40ms
+step:400/500 val_loss:3.4653 val_bpb:2.0523 train_time:712467ms step_avg:1781.17ms
+step:500/500 train_loss:3.4454 train_time:887786ms step_avg:1775.57ms
+step:500/500 val_loss:3.4461 val_bpb:2.0410 train_time:887786ms step_avg:1775.57ms
+peak memory allocated: 22723 MiB reserved: 23056 MiB
+ema:applying EMA weights
+DIAGNOSTIC post_ema val_loss:3.7390 val_bpb:2.2145 eval_time:69972ms
+export_mode:fused_int8
+Fused export: 55 tensors, 17276986 total params
+Serialized model fused_int8+lzma: 9153128 bytes
+Code size: 29798 bytes
+Total submission size: 9182926 bytes (9.18 MB)
+Quant stats: {'param_count': 17276986, 'num_tensors': 55, 'num_float_tensors': 22, 'num_nonfloat_tensors': 0, 'baseline_tensor_bytes': 34864360, 'int8_payload_bytes': 17408194}
+final_fused_int8_roundtrip val_loss:3.7442 val_bpb:2.2175 eval_time:133023ms
+final_fused_int8_roundtrip_exact val_loss:3.74419890 val_bpb:2.21752549

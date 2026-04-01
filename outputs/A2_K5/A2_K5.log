@@ -707,3 +707,47 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+====================================================================================================
+Running Python 3.11.15 (main, Mar 11 2026, 17:20:07) [GCC 14.3.0]
+Running PyTorch 2.11.0+cu128
+====================================================================================================
+val_bpb:enabled tokenizer_kind=sentencepiece
+val_tokens:62021632
+=== Universal Transformer with Random Matrix Adapters ===
+model_params:23470144 (adapter:22118400 step:16896 embed:1179648 scalar:155200)
+architecture: d=768 heads=12 kv=6 mlp=3.0x R=11 K=5 rank=384 strategy=phase
+random_seed:42
+optimizer: AdamW (adapter_lr=0.01 embed_lr=0.035 scalar_lr=0.025)
+export_mode:fused_int8 qat:True qat_threshold:0.85
+water_cycle: enabled=False
+world_size:1 grad_accum_steps:8
+train_batch_tokens:524288 train_seq_len:2048 iterations:500
+seed:1337
+step:0/500 val_loss:6.9404 val_bpb:4.1105 train_time:0ms step_avg:0.01ms
+step:1/500 train_loss:6.9404 train_time:13791ms step_avg:13791.27ms
+step:2/500 train_loss:6.2103 train_time:15555ms step_avg:7777.52ms
+step:3/500 train_loss:5.9839 train_time:17315ms step_avg:5771.70ms
+step:4/500 train_loss:5.8883 train_time:19076ms step_avg:4769.02ms
+step:5/500 train_loss:5.6740 train_time:20839ms step_avg:4167.74ms
+step:6/500 train_loss:5.5422 train_time:22600ms step_avg:3766.59ms
+step:7/500 train_loss:5.3467 train_time:24361ms step_avg:3480.20ms
+step:8/500 train_loss:5.2215 train_time:26127ms step_avg:3265.92ms
+step:9/500 train_loss:5.0930 train_time:27892ms step_avg:3099.08ms
+step:10/500 train_loss:4.9914 train_time:29655ms step_avg:2965.49ms
+step:100/500 val_loss:3.7409 val_bpb:2.2156 train_time:188345ms step_avg:1883.45ms
+step:200/500 val_loss:3.5873 val_bpb:2.1246 train_time:364493ms step_avg:1822.47ms
+step:300/500 val_loss:3.5115 val_bpb:2.0797 train_time:540658ms step_avg:1802.19ms
+step:400/500 val_loss:3.4653 val_bpb:2.0523 train_time:716827ms step_avg:1792.07ms
+step:500/500 train_loss:3.4456 train_time:899521ms step_avg:1799.04ms
+step:500/500 val_loss:3.4461 val_bpb:2.0410 train_time:899522ms step_avg:1799.04ms
+peak memory allocated: 22905 MiB reserved: 23194 MiB
+ema:applying EMA weights
+DIAGNOSTIC post_ema val_loss:3.7425 val_bpb:2.2165 eval_time:128918ms
+export_mode:fused_int8
+Fused export: 81 tensors, 27893854 total params
+Serialized model fused_int8+lzma: 13736524 bytes
+Code size: 29896 bytes
+Total submission size: 13766420 bytes (13.77 MB)
+Quant stats: {'param_count': 27893854, 'num_tensors': 81, 'num_float_tensors': 34, 'num_nonfloat_tensors': 0, 'baseline_tensor_bytes': 56098168, 'int8_payload_bytes': 28046650}
+final_fused_int8_roundtrip val_loss:3.7473 val_bpb:2.2194 eval_time:134530ms
+final_fused_int8_roundtrip_exact val_loss:3.74734670 val_bpb:2.21938980
