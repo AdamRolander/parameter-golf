@@ -1,0 +1,13 @@
+Create conda env
+
+conda create -n pgolf python=3.11
+conda activate pgolf
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+pip install numpy sentencepiece huggingface-hub datasets tqdm zstandard
+pip install psutil packaging ninja
+MAX_JOBS=2 pip install flash-attn --no-build-isolation
+
+---
+Download 1 shard of data for speed
+
+python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 1
